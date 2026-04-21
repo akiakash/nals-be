@@ -4,6 +4,7 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const { createClient } = require("@supabase/supabase-js");
+const { Client: PgClient } = require("pg");
 
 require("dotenv").config();
 
@@ -76,6 +77,51 @@ const ensureSupabase = (res) => {
     return false;
   }
   return true;
+};
+
+/** PostgREST: relation not in schema cache (table missing in DB). */
+const respondSupabaseMissingTable = (error, res) => {
+  if (!error || error.code !== "PGRST205") return false;
+  res.status(503).json({
+    error:
+      "Supabase table is missing. Set DATABASE_URL in backend/.env and restart the server (tables are created on startup), or run backend/supabase/tables_enrolments_flyers.sql in the SQL Editor.",
+    code: error.code,
+    details: error.message,
+  });
+  return true;
+};
+
+/** Creates public.enrolments + public.flyers when DATABASE_URL is set (fixes PGRST205 without manual SQL). */
+const applyEnrolmentsFlyersSchemaIfConfigured = async () => {
+  const connectionString = process.env.DATABASE_URL || process.env.SUPABASE_DB_URL;
+  if (!connectionString) return;
+
+  const sqlPath = path.join(__dirname, "supabase", "tables_enrolments_flyers.sql");
+  if (!fs.existsSync(sqlPath)) {
+    console.warn("⚠️ Missing SQL file:", sqlPath);
+    return;
+  }
+
+  const sql = fs.readFileSync(sqlPath, "utf8");
+  const client = new PgClient({
+    connectionString,
+    ssl: connectionString.includes("localhost") ? false : { rejectUnauthorized: false },
+  });
+
+  try {
+    await client.connect();
+    await client.query(sql);
+    console.log("✅ Applied enrolments + flyers schema (DATABASE_URL)");
+  } catch (err) {
+    console.warn("⚠️ Could not apply enrolments/flyers schema:", err.message);
+    console.warn("   Add DATABASE_URL from Supabase → Settings → Database (URI, port 5432).");
+  } finally {
+    try {
+      await client.end();
+    } catch {
+      /* ignore */
+    }
+  }
 };
 
 app.post("/addcollege", async (req, res) => {
@@ -230,7 +276,10 @@ app.post("/api/upload_flyers", (req, res) => {
 
     const rows = req.files.map((file) => ({ providerId, filePath: file.filename }));
     const { data, error } = await supabase.from("flyers").insert(rows).select("id");
-    if (error) return res.status(500).json({ message: "Database error", details: error.message });
+    if (error) {
+      if (respondSupabaseMissingTable(error, res)) return;
+      return res.status(500).json({ message: "Database error", details: error.message });
+    }
     return res.json({
       message: `${req.files.length} flyer(s) uploaded successfully`,
       inserted: (data || []).length,
@@ -241,7 +290,10 @@ app.post("/api/upload_flyers", (req, res) => {
 app.get("/api/flyers", async (req, res) => {
   if (!ensureSupabase(res)) return;
   const { data: flyers, error: flyersError } = await supabase.from("flyers").select("id,providerId,filePath").order("id", { ascending: false });
-  if (flyersError) return res.status(500).json({ message: flyersError.message });
+  if (flyersError) {
+    if (respondSupabaseMissingTable(flyersError, res)) return;
+    return res.status(500).json({ message: flyersError.message });
+  }
 
   const providerIds = [...new Set((flyers || []).map((row) => row.providerId).filter(Boolean))];
   let providersById = {};
@@ -269,7 +321,10 @@ app.put("/api/flyers/:id", upload.single("file"), async (req, res) => {
   if (!filePath) return res.status(400).json({ message: "filePath missing ❌" });
 
   const { data, error } = await supabase.from("flyers").update({ filePath }).eq("id", id).select("id");
-  if (error) return res.status(500).json({ message: error.message });
+  if (error) {
+    if (respondSupabaseMissingTable(error, res)) return;
+    return res.status(500).json({ message: error.message });
+  }
   if (!data || data.length === 0) return res.status(404).json({ message: "Flyer not found ❌" });
 
   return res.json({ message: "Updated successfully ✅", filePath, changedRows: data.length });
@@ -280,7 +335,10 @@ app.delete("/api/flyers/:id", async (req, res) => {
   const id = parseId(req.params.id);
   if (!id) return res.status(400).json({ message: "Invalid id" });
   const { error } = await supabase.from("flyers").delete().eq("id", id);
-  if (error) return res.status(500).json({ message: error.message });
+  if (error) {
+    if (respondSupabaseMissingTable(error, res)) return;
+    return res.status(500).json({ message: error.message });
+  }
   return res.json({ message: "Deleted successfully ✅" });
 });
 
@@ -290,7 +348,10 @@ app.get("/api/enrolments", async (req, res) => {
     .from("enrolments")
     .select("id,collegeId,enrolmentUrl,username,password,email,formsData")
     .order("id", { ascending: false });
-  if (enrolError) return res.status(500).json({ message: enrolError.message });
+  if (enrolError) {
+    if (respondSupabaseMissingTable(enrolError, res)) return;
+    return res.status(500).json({ message: enrolError.message });
+  }
 
   const providerIds = [...new Set((enrolments || []).map((row) => row.collegeId).filter(Boolean))];
   let providersById = {};
@@ -335,7 +396,10 @@ app.post("/api/enrolments", upload.array("files"), async (req, res) => {
   };
 
   const { error } = await supabase.from("enrolments").insert([payload]);
-  if (error) return res.status(500).json({ error: error.message });
+  if (error) {
+    if (respondSupabaseMissingTable(error, res)) return;
+    return res.status(500).json({ error: error.message });
+  }
   return res.json({ message: "Saved successfully ✅" });
 });
 
@@ -345,7 +409,10 @@ app.put("/api/enrolments/:id", async (req, res) => {
   if (!id) return res.status(400).json({ message: "Invalid id" });
   const { enrolmentUrl, username, password, email } = req.body;
   const { error } = await supabase.from("enrolments").update({ enrolmentUrl, username, password, email }).eq("id", id);
-  if (error) return res.status(500).json({ message: error.message });
+  if (error) {
+    if (respondSupabaseMissingTable(error, res)) return;
+    return res.status(500).json({ message: error.message });
+  }
   return res.json({ message: "Updated ✅" });
 });
 
@@ -354,7 +421,10 @@ app.delete("/api/enrolments/:id", async (req, res) => {
   const id = parseId(req.params.id);
   if (!id) return res.status(400).json({ message: "Invalid id" });
   const { error } = await supabase.from("enrolments").delete().eq("id", id);
-  if (error) return res.status(500).json({ message: error.message });
+  if (error) {
+    if (respondSupabaseMissingTable(error, res)) return;
+    return res.status(500).json({ message: error.message });
+  }
   return res.json({ message: "Deleted ✅" });
 });
 
@@ -465,6 +535,12 @@ app.get("/api/health/supabase", async (req, res) => {
 const PORT = Number(process.env.PORT) || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
+  if (!process.env.DATABASE_URL && !process.env.SUPABASE_DB_URL) {
+    console.warn(
+      "💡 enrolments/flyers: set DATABASE_URL in backend/.env to auto-create tables on startup, or run backend/supabase/tables_enrolments_flyers.sql in Supabase SQL Editor."
+    );
+  }
+  await applyEnrolmentsFlyersSchemaIfConfigured();
   const supabaseStatus = await checkSupabaseConnection();
   if (supabaseStatus.ok) {
     console.log(`✅ ${supabaseStatus.message}`);
