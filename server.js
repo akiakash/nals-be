@@ -10,6 +10,15 @@ require("dotenv").config();
 
 const app = express();
 
+const corsOptions = {
+  origin: true,
+  credentials: true,
+  methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+  optionsSuccessStatus: 204,
+  maxAge: 86400,
+};
+
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 const supabaseHealthTable = process.env.SUPABASE_HEALTHCHECK_TABLE || "profile";
@@ -46,8 +55,11 @@ const checkSupabaseConnection = async () => {
   return { ok: false, message: error.message || "Supabase check failed", errorCode: error.code || null };
 };
 
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+app.get("/health", (req, res) => res.status(200).type("text/plain").send("ok"));
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 const allowedDepartments = ["IT", "HR", "Finance", "Marketing", "Sales", "Support", "Admin", "Operations", "Legal", "Design"];
@@ -403,11 +415,11 @@ app.post("/api/enrolments", upload.array("files"), async (req, res) => {
   return res.json({ message: "Saved successfully ✅" });
 });
 
-app.put("/api/enrolments/:id", async (req, res) => {
+app.put("/api/enrolments/:id", upload.none(), async (req, res) => {
   if (!ensureSupabase(res)) return;
   const id = parseId(req.params.id);
   if (!id) return res.status(400).json({ message: "Invalid id" });
-  const { enrolmentUrl, username, password, email } = req.body;
+  const { enrolmentUrl, username, password, email } = req.body || {};
   const { error } = await supabase.from("enrolments").update({ enrolmentUrl, username, password, email }).eq("id", id);
   if (error) {
     if (respondSupabaseMissingTable(error, res)) return;
@@ -533,8 +545,9 @@ app.get("/api/health/supabase", async (req, res) => {
 });
 
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, async () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
+
+/** Must not be the raw `async` `app.listen` callback — unhandled rejections there can exit Node. */
+const runAfterListen = async () => {
   if (!process.env.DATABASE_URL && !process.env.SUPABASE_DB_URL) {
     console.warn(
       "💡 enrolments/flyers: set DATABASE_URL in backend/.env to auto-create tables on startup, or run backend/supabase/tables_enrolments_flyers.sql in Supabase SQL Editor."
@@ -547,4 +560,22 @@ app.listen(PORT, async () => {
   } else {
     console.error(`❌ ${supabaseStatus.message}`);
   }
+};
+
+app.listen(PORT, (err) => {
+  // Express 5 wires this callback to server.once("error", ...) as well as listen success.
+  // On EADDRINUSE the error path invokes it with err — must not treat that as "running".
+  if (err) {
+    console.error(`❌ Failed to bind port ${PORT}:`, err.message || err);
+    if (err.code === "EADDRINUSE") {
+      console.error(
+        `   Port ${PORT} is already in use. Stop the other process or set PORT in backend/.env to a free port.`
+      );
+    }
+    process.exit(1);
+  }
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  runAfterListen().catch((startupErr) => {
+    console.error("Startup error (server keeps running):", startupErr?.message || startupErr);
+  });
 });
